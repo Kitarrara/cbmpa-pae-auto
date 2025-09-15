@@ -1,39 +1,61 @@
 import os
-import time
+import re
 from typing import Optional, Dict
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
-# === Ajuste estes seletores conforme o PAE 4.0 real ===
+# === Seletores genéricos e alternativas; ajustaremos depois com base nos artefatos ===
 SELECTORS = {
-    "cpf_input": 'input[name="j_username"], input[name="login"], #username, input[autocomplete="username"]',
+    "cpf_input": 'input[name="j_username"], input[name="login"], #username, input[autocomplete="username"], input[type="text"]:below(:text("CPF"))',
     "senha_input": 'input[type="password"], input[name="j_password"], #password',
     "entrar_button": 'button:has-text("Entrar"), button:has-text("Login"), input[type="submit"]',
-    # Depois do login (portal Governo Digital)
     "pae40_card": 'a:has-text("PAE 4.0"), a[title*="PAE 4.0"]',
-    # Menu/consulta
-    "menu_consultar_tramitados": 'a[title*="Consultar processos tramitados"], a:has-text("Consultar processos tramitados")',
-    "campo_pesquisa_protocolo": 'input[placeholder*="Protocolo"], input[name*="protocolo"], input[aria-label*="Protocolo"]',
+    "menu_consultar_tramitados": 'a[title*="Consultar processos tramitados"], a:has-text("Consultar processos tramitados"), [role="menuitem"]:has-text("Tramitados")',
+    "campo_pesquisa_protocolo": 'input[placeholder*="Protocolo"], input[name*="protocolo"], input[aria-label*="Protocolo"], input[type="search"]',
     "botao_buscar": 'button:has-text("Buscar"), button:has-text("Pesquisar"), button:has-text("Consultar")',
-    # Resultados/detalhes
-    "primeiro_resultado": 'table tr >> nth=1, .ui-datatable-tablewrapper tbody tr:first-child',
-    # Campos de interesse (ajustar estratégia conforme DOM real)
-    "campo_objeto": 'text=Objeto',
-    "campo_rito": 'text=Rito, text=Modalidade, text=Tipo',
-    "campo_etapa": 'text=Etapa',
-    "campo_setor": 'text=Setor, text=Unidade',
-    "campo_valor": 'text=Valor, text=R$',
-    "campo_situacao": 'text=Situação, text=Status',
+    "primeiro_resultado": 'table tr >> nth=1, .ui-datatable-tablewrapper tbody tr:first-child, tbody tr[data-ri="0"]'
 }
 
-def is_truthy(val: Optional[str]) -> bool:
-    return bool(val and str(val).strip())
+LABELS = {
+    "Objeto": ["Objeto"],
+    "Rito / Modalidade": ["Rito", "Modalidade", "Tipo"],
+    "Etapa atual": ["Etapa", "Fase atual"],
+    "Dias na etapa": [],  # calcularemos depois se houver datas
+    "Setor atual": ["Setor", "Unidade", "Órgão"],
+    "Valor": ["Valor", "R$"],
+    "Situação": ["Situação", "Status"]
+}
 
-def safe_inner_text(el):
-    try:
-        return el.inner_text().strip()
-    except Exception:
-        return ""
+def _sanitize_filename(s: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9_.-]+', "_", s)
+
+def _find_after_label_text(page_text: str, labels):
+    """
+    Heurística simples: procura uma label e captura o texto imediatamente após (quebra de linha).
+    """
+    low = page_text.lower()
+    for label in labels:
+        i = low.find(label.lower())
+        if i != -1:
+            snippet = page_text[i:i+400]
+            # pega a parte após a 1ª quebra de linha
+            return snippet.split("\n", 1)[-1].strip()[:300]
+    return ""
+
+def _kv_from_html(page_html: str, labels):
+    """
+    Outra heurística: procura <th>Label</th><td>Valor</td> ou label: valor
+    """
+    for label in labels:
+        # th/td
+        m = re.search(rf"<th[^>]*>\s*{re.escape(label)}\s*</th>\s*<td[^>]*>(.*?)</td>", page_html, re.IGNORECASE|re.DOTALL)
+        if m:
+            return re.sub(r"<[^>]+>", " ", m.group(1)).strip()
+        # label: valor
+        m2 = re.search(rf"{re.escape(label)}\s*[:\-]\s*(.+?)<", page_html, re.IGNORECASE|re.DOTALL)
+        if m2:
+            return re.sub(r"<[^>]+>", " ", m2.group(1)).strip()
+    return ""
 
 class PAEClient:
     def __init__(self):
@@ -42,106 +64,93 @@ class PAEClient:
         self.cpf = os.environ["PAE_CPF"]
         self.senha = os.environ["PAE_SENHA"]
         self.headless = os.getenv("HEADLESS", "true").lower() == "true"
+        self.artifacts_dir = "artifacts"
+        os.makedirs(self.artifacts_dir, exist_ok=True)
 
     def fetch_process_data(self, pae_number: str) -> Optional[Dict[str, str]]:
+        safe = _sanitize_filename(pae_number)
+
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
+            browser = p.chromium.launch(headless=self.headless, args=["--disable-gpu"])
             context = browser.new_context()
             page = context.new_page()
-            page.set_default_timeout(30000)  # 30s
+            page.set_default_timeout(45000)  # 45s
 
             try:
                 page.goto(self.base_url)
+                page.wait_for_load_state("load")
 
                 # Login
-                page.wait_for_load_state("load")
-                page.fill(SELECTORS["cpf_input"], self.cpf)
-                page.fill(SELECTORS["senha_input"], self.senha)
-                page.click(SELECTORS["entrar_button"])
+                try:
+                    page.fill(SELECTORS["cpf_input"], self.cpf)
+                    page.fill(SELECTORS["senha_input"], self.senha)
+                    page.click(SELECTORS["entrar_button"])
+                except Exception:
+                    pass  # alguns logins podem estar automaticamente autenticados (SSO)
 
-                # Espera o portal carregar
                 page.wait_for_load_state("networkidle")
 
                 # Entrar no PAE 4.0
                 try:
                     page.click(SELECTORS["pae40_card"])
+                    page.wait_for_load_state("networkidle")
                 except Exception:
-                    # Se o PAE abre em nova aba/iframe, adapte aqui
                     pass
 
-                page.wait_for_load_state("networkidle")
-
-                # Abrir consulta tramitados
+                # Ir para "Consultar processos tramitados"
                 try:
                     page.click(SELECTORS["menu_consultar_tramitados"])
+                    page.wait_for_load_state("networkidle")
                 except Exception:
-                    # Talvez precise abrir o menu lateral primeiro — ajustar conforme DOM
                     pass
 
-                # Pesquisar pelo número do protocolo
-                page.wait_for_timeout(1000)
+                # Buscar o protocolo
+                page.wait_for_timeout(1200)
                 page.fill(SELECTORS["campo_pesquisa_protocolo"], pae_number)
                 page.click(SELECTORS["botao_buscar"])
                 page.wait_for_load_state("networkidle")
                 page.wait_for_timeout(1500)
 
-                # Abrir primeiro resultado (se necessário)
+                # Abrir primeiro resultado (quando há lista)
                 try:
                     page.click(SELECTORS["primeiro_resultado"])
                     page.wait_for_timeout(1200)
                 except Exception:
                     pass
 
-                # Estratégia simplificada: coletar textos do container principal
-                content_text = page.inner_text("body")
+                # Captura artefatos para debug
+                html = page.content()
+                with open(os.path.join(self.artifacts_dir, f"{safe}.html"), "w", encoding="utf-8") as f:
+                    f.write(html)
+                page.screenshot(path=os.path.join(self.artifacts_dir, f"{safe}.png"), full_page=True)
 
-                def find_value(labels):
-                    # Busca heurística simples: acha a label e pega alguns chars após
-                    for label in labels:
-                        idx = content_text.lower().find(label.lower())
-                        if idx != -1:
-                            snippet = content_text[idx: idx+300]
-                            return snippet.split("\n", 1)[-1].strip()[:200]
-                    return ""
+                # Estratégias de extração
+                body_text = page.inner_text("body")
 
-                objeto = find_value(["Objeto"])
-                rito = find_value(["Rito", "Modalidade", "Tipo"])
-                etapa = find_value(["Etapa"])
-                setor = find_value(["Setor", "Unidade"])
-                valor = find_value(["Valor", "R$"])
-                situacao = find_value(["Situação", "Status"])
+                data = {"PAE": pae_number, "Link PAE": page.url}
 
-                data = {
-                    "PAE": pae_number,
-                    "Objeto": objeto,
-                    "Rito / Modalidade": rito,
-                    "Etapa atual": etapa,
-                    "Dias na etapa": "",  # TODO: calcular se houver datas expostas
-                    "Setor atual": setor,
-                    "Valor": valor,
-                    "Situação": situacao,
-                    "Link PAE": page.url
-                }
-
-                # Se quiser filtrar apenas compras públicas:
-                if not self.is_compra_publica(data):
-                    # Retorne um dicionário mínimo, ou None para ignorar
-                    # Aqui vamos retornar os dados mesmo assim, para transparência
-                    pass
+                for k, labels in LABELS.items():
+                    val = ""
+                    if labels:
+                        # 1) tenta por HTML (th/td, label:valor)
+                        val = _kv_from_html(html, labels)
+                        # 2) fallback: busca por texto após a label
+                        if not val:
+                            val = _find_after_label_text(body_text, labels)
+                    else:
+                        val = ""  # "Dias na etapa" calcularemos depois
+                    data[k] = val.strip()
 
                 return data
 
             except Exception as e:
                 print(f"[ERRO] {e}")
+                # Mesmo em erro, tente salvar um print para debug
+                try:
+                    page.screenshot(path=os.path.join(self.artifacts_dir, f"{safe}_ERROR.png"), full_page=True)
+                except Exception:
+                    pass
                 return None
             finally:
                 context.close()
                 browser.close()
-
-    def is_compra_publica(self, data: Dict[str, str]) -> bool:
-        texto = " ".join([str(v) for v in data.values()]).lower()
-        keywords = [
-            "licitação", "pregão", "dispensa", "inexigibilidade",
-            "ata de registro", "arp", "srp", "adesão", "contrato", "compra", "aquisição"
-        ]
-        return any(k in texto for k in keywords)
