@@ -35,3 +35,22 @@ jobs:
           LOG_LEVEL: "INFO"
         run: |
           python run.py
+      - name: Run scraper
+        env:
+          PAE_CPF: ${{ secrets.PAE_CPF }}
+          PAE_SENHA: ${{ secrets.PAE_SENHA }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_TAB_NAME: ${{ secrets.SHEET_TAB_NAME }}
+          SHEET_GID: ${{ secrets.SHEET_GID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          HEADLESS: "true"
+          LOG_LEVEL: "INFO"
+        run: |
+          python run.py
+
+      - name: Upload artifacts (prints e HTML do PAE)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pae-artifacts
+          path: artifacts
